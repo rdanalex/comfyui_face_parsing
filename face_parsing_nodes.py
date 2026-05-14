@@ -739,6 +739,18 @@ class FaceParsingResultsParser:
                 "neck_l": ("BOOLEAN", {"default": True}),
                 "neck": ("BOOLEAN", {"default": True}),
                 "cloth": ("BOOLEAN", {"default": True}),
+                "philtrum": ("BOOLEAN", {"default": False}),
+                "expand_eye_region": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 200,
+                    "step": 1,
+                    "tooltip": "Dilate detected eye regions by this many pixels to catch partially-occluded eyes."
+                }),
+                "force_symmetric_eyes": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "When one eye is missing/tiny, mirror the detected eye across the nose centreline to always mask both eyes."
+                }),
             }
         }
 
@@ -749,7 +761,7 @@ class FaceParsingResultsParser:
     CATEGORY = "face_parsing"
 
     def main(
-            self, 
+            self,
             result: Tensor,
             background: bool,
             skin: bool,
@@ -769,48 +781,148 @@ class FaceParsingResultsParser:
             ear_r: bool,
             neck_l: bool,
             neck: bool,
-            cloth: bool):
+            cloth: bool,
+            philtrum: bool = False,
+            expand_eye_region: int = 0,
+            force_symmetric_eyes: bool = False):
         masks = []
         for item in result:
+            h, w = item.shape
             mask = torch.zeros(item.shape, dtype=torch.uint8)
+
+            # --- Standard label masking (unchanged) ---
             if (background):
                 mask = mask | torch.where(item == 0, 1, 0)
             if (skin):
                 mask = mask | torch.where(item == 1, 1, 0)
             if (nose):
-                mask = mask | torch.where(item == 2, 1, 0)    
+                mask = mask | torch.where(item == 2, 1, 0)
             if (eye_g):
-                mask = mask | torch.where(item == 3, 1, 0)  
+                mask = mask | torch.where(item == 3, 1, 0)
             if (r_eye):
-                mask = mask | torch.where(item == 4, 1, 0) 
+                mask = mask | torch.where(item == 4, 1, 0)
             if (l_eye):
-                mask = mask | torch.where(item == 5, 1, 0) 
+                mask = mask | torch.where(item == 5, 1, 0)
             if (r_brow):
-                mask = mask | torch.where(item == 6, 1, 0) 
+                mask = mask | torch.where(item == 6, 1, 0)
             if (l_brow):
-                mask = mask | torch.where(item == 7, 1, 0) 
+                mask = mask | torch.where(item == 7, 1, 0)
             if (r_ear):
-                mask = mask | torch.where(item == 8, 1, 0) 
+                mask = mask | torch.where(item == 8, 1, 0)
             if (l_ear):
-                mask = mask | torch.where(item == 9, 1, 0) 
+                mask = mask | torch.where(item == 9, 1, 0)
             if (mouth):
-                mask = mask | torch.where(item == 10, 1, 0) 
+                mask = mask | torch.where(item == 10, 1, 0)
             if (u_lip):
-                mask = mask | torch.where(item == 11, 1, 0) 
+                mask = mask | torch.where(item == 11, 1, 0)
             if (l_lip):
-                mask = mask | torch.where(item == 12, 1, 0)   
+                mask = mask | torch.where(item == 12, 1, 0)
             if (hair):
-                mask = mask | torch.where(item == 13, 1, 0) 
+                mask = mask | torch.where(item == 13, 1, 0)
             if (hat):
-                mask = mask | torch.where(item == 14, 1, 0) 
+                mask = mask | torch.where(item == 14, 1, 0)
             if (ear_r):
-                mask = mask | torch.where(item == 15, 1, 0) 
+                mask = mask | torch.where(item == 15, 1, 0)
             if (neck_l):
-                mask = mask | torch.where(item == 16, 1, 0) 
+                mask = mask | torch.where(item == 16, 1, 0)
             if (neck):
-                mask = mask | torch.where(item == 17, 1, 0)   
+                mask = mask | torch.where(item == 17, 1, 0)
             if (cloth):
-                mask = mask | torch.where(item == 18, 1, 0)         
+                mask = mask | torch.where(item == 18, 1, 0)
+
+            # --- Philtrum (synthetic region between nose bottom and upper-lip top) ---
+            # The BiSeNet model has no philtrum label; we derive it geometrically.
+            if philtrum:
+                nose_bool = (item == 2)
+                ulip_bool = (item == 11)
+                if nose_bool.any() and ulip_bool.any():
+                    nose_rows, nose_cols_all = torch.where(nose_bool)
+                    ulip_rows, ulip_cols_all = torch.where(ulip_bool)
+                    nose_bottom = int(nose_rows.max().item())
+                    ulip_top    = int(ulip_rows.min().item())
+                    # Horizontal bounds: intersection of nose & lip column ranges
+                    n_left  = int(nose_cols_all.min().item())
+                    n_right = int(nose_cols_all.max().item())
+                    u_left  = int(ulip_cols_all.min().item())
+                    u_right = int(ulip_cols_all.max().item())
+                    ph_left  = max(n_left, u_left)
+                    ph_right = min(n_right, u_right)
+                    # Fall back to average if no horizontal overlap
+                    if ph_left >= ph_right:
+                        ph_left  = (n_left + u_left) // 2
+                        ph_right = (n_right + u_right) // 2
+                    row_start = min(nose_bottom, ulip_top)
+                    row_end   = max(nose_bottom, ulip_top) + 1
+                    ph_mask = torch.zeros(item.shape, dtype=torch.uint8)
+                    ph_mask[row_start:row_end, ph_left:ph_right + 1] = 1
+                    # Remove pixels already belonging to nose or upper lip
+                    ph_mask = ph_mask & (~nose_bool.byte()) & (~ulip_bool.byte())
+                    mask = mask | ph_mask
+
+            # --- Force symmetric eyes ---
+            # If one eye is not detected (or has very few pixels), mirror the
+            # other eye horizontally across the nose centreline so that both
+            # eyes are always covered when partially occluded.
+            if (r_eye or l_eye) and force_symmetric_eyes:
+                MIN_EYE_PIXELS = 20  # threshold to consider an eye "detected"
+
+                r_eye_bool = (item == 4)
+                l_eye_bool = (item == 5)
+                r_count = int(r_eye_bool.sum().item())
+                l_count = int(l_eye_bool.sum().item())
+
+                # Determine face centreline column from the nose region
+                nose_bool2 = (item == 2)
+                if nose_bool2.any():
+                    center_col = int(torch.where(nose_bool2)[1].float().mean().item())
+                elif r_count > MIN_EYE_PIXELS and l_count > MIN_EYE_PIXELS:
+                    rc = int(torch.where(r_eye_bool)[1].float().mean().item())
+                    lc = int(torch.where(l_eye_bool)[1].float().mean().item())
+                    center_col = (rc + lc) // 2
+                elif r_count > MIN_EYE_PIXELS:
+                    center_col = int(torch.where(r_eye_bool)[1].float().mean().item())
+                elif l_count > MIN_EYE_PIXELS:
+                    center_col = int(torch.where(l_eye_bool)[1].float().mean().item())
+                else:
+                    center_col = w // 2
+
+                def _mirror_region(src_bool, ctr, img_w):
+                    """Pixel-accurate horizontal mirror of a boolean region."""
+                    rows, cols = torch.where(src_bool)
+                    if len(rows) == 0:
+                        return torch.zeros(src_bool.shape, dtype=torch.uint8)
+                    mirrored_cols = (2 * ctr - cols).clamp(0, img_w - 1)
+                    out = torch.zeros(src_bool.shape, dtype=torch.uint8)
+                    out[rows, mirrored_cols] = 1
+                    return out
+
+                # Right eye missing but left eye present -> mirror left onto right
+                if r_eye and r_count < MIN_EYE_PIXELS and l_count >= MIN_EYE_PIXELS:
+                    mask = mask | _mirror_region(l_eye_bool, center_col, w)
+
+                # Left eye missing but right eye present -> mirror right onto left
+                if l_eye and l_count < MIN_EYE_PIXELS and r_count >= MIN_EYE_PIXELS:
+                    mask = mask | _mirror_region(r_eye_bool, center_col, w)
+
+            # --- Expand eye region (morphological dilation) ---
+            # Dilates the combined eye mask so that partially-detected eye pixels
+            # grow outward, improving coverage on angled or partially-occluded faces.
+            if expand_eye_region > 0 and (r_eye or l_eye or eye_g):
+                eye_combined = torch.zeros(item.shape, dtype=torch.uint8)
+                if r_eye:
+                    eye_combined = eye_combined | (item == 4).byte()
+                if l_eye:
+                    eye_combined = eye_combined | (item == 5).byte()
+                if eye_g:
+                    eye_combined = eye_combined | (item == 3).byte()
+                if eye_combined.any():
+                    eye_np = eye_combined.numpy().astype(np.uint8)
+                    ksize = expand_eye_region * 2 + 1
+                    kernel = cv2.getStructuringElement(
+                        cv2.MORPH_ELLIPSE, (ksize, ksize))
+                    dilated = cv2.dilate(eye_np, kernel)
+                    mask = mask | torch.from_numpy(dilated)
+
             masks.append(mask.float())
         masks_out = torch.stack(masks, dim=0)
         return (masks_out,)
