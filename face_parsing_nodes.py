@@ -853,9 +853,10 @@ class FaceParsingResultsParser:
                         ph_right = (n_right + u_right) // 2
                     row_start = min(nose_bottom, ulip_top) - 1
                     row_end   = max(nose_bottom, ulip_top) + 2
-                    ph_left = max(0, ph_left - 2)
-                    ph_right = min(w - 1, ph_right + 2)
-                    ph_mask = torch.zeros(item.shape, dtype=torch.uint8)
+        h, w = item.shape
+        ph_left = max(0, ph_left - 2)
+        ph_right = min(w - 1, ph_right + 2)
+        ph_mask = torch.zeros(item.shape, dtype=torch.uint8)
                     ph_mask[row_start:row_end, ph_left:ph_right + 1] = 1
                     # Remove pixels already belonging to nose or upper lip
                     ph_mask = ph_mask & (~nose_bool.byte()) & (~ulip_bool.byte())
@@ -1778,6 +1779,7 @@ class FaceParsingPhiltrumMask:
         if ph_left >= ph_right:
             ph_left = (n_left + u_left) // 2
             ph_right = (n_right + u_right) // 2
+        h, w = item.shape
         row_start = min(nose_bottom, ulip_top) - 1
         row_end = max(nose_bottom, ulip_top) + 2
         ph_left = max(0, ph_left - 2)
