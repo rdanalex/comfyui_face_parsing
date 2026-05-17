@@ -1596,6 +1596,7 @@ class FaceParsingMaskBuilder:
         if ph_left >= ph_right:
             ph_left = (n_left + u_left) // 2
             ph_right = (n_right + u_right) // 2
+        h, w = item.shape
         row_start = min(nose_bottom, ulip_top) - 1
         row_end = max(nose_bottom, ulip_top) + 2
         ph_left = max(0, ph_left - 2)
