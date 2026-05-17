@@ -851,8 +851,10 @@ class FaceParsingResultsParser:
                     if ph_left >= ph_right:
                         ph_left  = (n_left + u_left) // 2
                         ph_right = (n_right + u_right) // 2
-                    row_start = min(nose_bottom, ulip_top)
-                    row_end   = max(nose_bottom, ulip_top) + 1
+                    row_start = min(nose_bottom, ulip_top) - 1
+                    row_end   = max(nose_bottom, ulip_top) + 2
+                    ph_left = max(0, ph_left - 2)
+                    ph_right = min(w - 1, ph_right + 2)
                     ph_mask = torch.zeros(item.shape, dtype=torch.uint8)
                     ph_mask[row_start:row_end, ph_left:ph_right + 1] = 1
                     # Remove pixels already belonging to nose or upper lip
@@ -1469,6 +1471,365 @@ class ColorAdjust:
         return (result,)
 
 
+class FaceParsingMaskBuilder:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "result": ("FACE_PARSING_RESULT", {}),
+                "mode": (["include_selected", "exclude_selected"], {"default": "include_selected"}),
+                "background": ("BOOLEAN", {"default": False}),
+                "skin": ("BOOLEAN", {"default": False}),
+                "nose": ("BOOLEAN", {"default": False}),
+                "eye_g": ("BOOLEAN", {"default": False}),
+                "r_eye": ("BOOLEAN", {"default": False}),
+                "l_eye": ("BOOLEAN", {"default": False}),
+                "r_brow": ("BOOLEAN", {"default": False}),
+                "l_brow": ("BOOLEAN", {"default": False}),
+                "r_ear": ("BOOLEAN", {"default": False}),
+                "l_ear": ("BOOLEAN", {"default": False}),
+                "mouth": ("BOOLEAN", {"default": False}),
+                "u_lip": ("BOOLEAN", {"default": False}),
+                "l_lip": ("BOOLEAN", {"default": False}),
+                "hair": ("BOOLEAN", {"default": False}),
+                "hat": ("BOOLEAN", {"default": False}),
+                "ear_r": ("BOOLEAN", {"default": False}),
+                "neck_l": ("BOOLEAN", {"default": False}),
+                "neck": ("BOOLEAN", {"default": False}),
+                "cloth": ("BOOLEAN", {"default": False}),
+                "philtrum_mode": (["ignore", "include", "exclude"], {"default": "ignore"}),
+                "detect_iris": ("BOOLEAN", {"default": False}),
+                "expand_eye_region": ("INT", {
+                    "default": 0,
+                    "min": 0,
+                    "max": 200,
+                    "step": 1,
+                    "tooltip": "Dilate detected eye regions by this many pixels."
+                }),
+                "force_symmetric_eyes": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Mirror a single detected eye across the nose centreline to cover both eyes."
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "main"
+    CATEGORY = "face_parsing"
+
+    def main(self, result, mode, background, skin, nose, eye_g, r_eye, l_eye,
+             r_brow, l_brow, r_ear, l_ear, mouth, u_lip, l_lip, hair, hat,
+             ear_r, neck_l, neck, cloth, philtrum_mode, detect_iris,
+             expand_eye_region, force_symmetric_eyes):
+        
+        feature_map = {
+            0: background, 1: skin, 2: nose, 3: eye_g, 4: r_eye, 5: l_eye,
+            6: r_brow, 7: l_brow, 8: r_ear, 9: l_ear, 10: mouth,
+            11: u_lip, 12: l_lip, 13: hair, 14: hat, 15: ear_r,
+            16: neck_l, 17: neck, 18: cloth
+        }
+        
+        masks = []
+        for item in result:
+            h, w = item.shape
+            
+            if mode == "include_selected":
+                mask = torch.zeros(item.shape, dtype=torch.uint8)
+                for label, selected in feature_map.items():
+                    if selected:
+                        mask = mask | (item == label).byte()
+            else:  # exclude_selected
+                mask = torch.zeros(item.shape, dtype=torch.uint8)
+                for label in range(1, 19):
+                    mask = mask | (item == label).byte()
+                for label, selected in feature_map.items():
+                    if selected:
+                        mask = mask & (item != label).byte()
+            
+            # Philtrum handling
+            if philtrum_mode in ("include", "exclude"):
+                ph_mask = self._compute_philtrum(item)
+                if ph_mask is not None:
+                    if philtrum_mode == "include":
+                        mask = mask | ph_mask
+                    else:
+                        mask = mask & (1 - ph_mask)
+            
+            # Force symmetric eyes
+            if force_symmetric_eyes:
+                mask = self._apply_symmetric_eyes(mask, item, h, w, r_eye, l_eye, mode)
+            
+            # Expand eye region
+            if expand_eye_region > 0:
+                mask = self._expand_eyes(mask, item, expand_eye_region, r_eye, l_eye, eye_g, mode)
+            
+            # Detect iris
+            if detect_iris:
+                iris_mask = self._detect_iris(item, h, w)
+                mask = mask | iris_mask
+            
+            masks.append(mask.float())
+        
+        masks_out = torch.stack(masks, dim=0)
+        return (masks_out,)
+
+    def _compute_philtrum(self, item):
+        nose_bool = (item == 2)
+        ulip_bool = (item == 11)
+        if not nose_bool.any() or not ulip_bool.any():
+            return None
+        
+        nose_rows, nose_cols_all = torch.where(nose_bool)
+        ulip_rows, ulip_cols_all = torch.where(ulip_bool)
+        nose_bottom = int(nose_rows.max().item())
+        ulip_top = int(ulip_rows.min().item())
+        n_left = int(nose_cols_all.min().item())
+        n_right = int(nose_cols_all.max().item())
+        u_left = int(ulip_cols_all.min().item())
+        u_right = int(ulip_cols_all.max().item())
+        ph_left = max(n_left, u_left)
+        ph_right = min(n_right, u_right)
+        if ph_left >= ph_right:
+            ph_left = (n_left + u_left) // 2
+            ph_right = (n_right + u_right) // 2
+        row_start = min(nose_bottom, ulip_top) - 1
+        row_end = max(nose_bottom, ulip_top) + 2
+        ph_left = max(0, ph_left - 2)
+        ph_right = min(w - 1, ph_right + 2)
+        ph_mask = torch.zeros(item.shape, dtype=torch.uint8)
+        ph_mask[row_start:row_end, ph_left:ph_right + 1] = 1
+        ph_mask = ph_mask & (~nose_bool).byte() & (~ulip_bool).byte()
+        return ph_mask
+
+    def _apply_symmetric_eyes(self, mask, item, h, w, r_eye, l_eye, mode):
+        MIN_EYE_PIXELS = 20
+        
+        r_eye_bool = (item == 4)
+        l_eye_bool = (item == 5)
+        r_count = int(r_eye_bool.sum().item())
+        l_count = int(l_eye_bool.sum().item())
+        
+        nose_bool = (item == 2)
+        if nose_bool.any():
+            center_col = int(torch.where(nose_bool)[1].float().mean().item())
+        elif r_count > MIN_EYE_PIXELS and l_count > MIN_EYE_PIXELS:
+            rc = int(torch.where(r_eye_bool)[1].float().mean().item())
+            lc = int(torch.where(l_eye_bool)[1].float().mean().item())
+            center_col = (rc + lc) // 2
+        elif r_count > MIN_EYE_PIXELS:
+            center_col = int(torch.where(r_eye_bool)[1].float().mean().item())
+        elif l_count > MIN_EYE_PIXELS:
+            center_col = int(torch.where(l_eye_bool)[1].float().mean().item())
+        else:
+            center_col = w // 2
+
+        def _mirror_region(src_bool, ctr, img_w):
+            rows, cols = torch.where(src_bool)
+            if len(rows) == 0:
+                return torch.zeros(src_bool.shape, dtype=torch.uint8)
+            mirrored_cols = (2 * ctr - cols).clamp(0, img_w - 1)
+            out = torch.zeros(src_bool.shape, dtype=torch.uint8)
+            out[rows, mirrored_cols] = 1
+            return out
+
+        include_r = r_eye if mode == "include_selected" else not r_eye
+        include_l = l_eye if mode == "include_selected" else not l_eye
+        
+        if include_r and r_count < MIN_EYE_PIXELS and l_count >= MIN_EYE_PIXELS:
+            mask = mask | _mirror_region(l_eye_bool, center_col, w)
+        if include_l and l_count < MIN_EYE_PIXELS and r_count >= MIN_EYE_PIXELS:
+            mask = mask | _mirror_region(r_eye_bool, center_col, w)
+        
+        return mask
+
+    def _expand_eyes(self, mask, item, expand_eye_region, r_eye, l_eye, eye_g, mode):
+        eye_combined = torch.zeros(item.shape, dtype=torch.uint8)
+        
+        include_r = r_eye if mode == "include_selected" else not r_eye
+        include_l = l_eye if mode == "include_selected" else not l_eye
+        include_g = eye_g if mode == "include_selected" else not eye_g
+        
+        if include_r:
+            eye_combined = eye_combined | (item == 4).byte()
+        if include_l:
+            eye_combined = eye_combined | (item == 5).byte()
+        if include_g:
+            eye_combined = eye_combined | (item == 3).byte()
+        
+        if eye_combined.any():
+            eye_np = eye_combined.numpy().astype(np.uint8)
+            ksize = expand_eye_region * 2 + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+            dilated = cv2.dilate(eye_np, kernel)
+            mask = mask | torch.from_numpy(dilated)
+        
+        return mask
+
+    def _detect_iris(self, item, h, w):
+        iris_mask = torch.zeros((h, w), dtype=torch.uint8)
+        
+        for eye_label in [4, 5]:
+            eye_bool = (item == eye_label)
+            if not eye_bool.any():
+                continue
+            
+            eye_np = eye_bool.numpy().astype(np.uint8)
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(eye_np, connectivity=8)
+            
+            for i in range(1, num_labels):
+                x, y, ew, eh, area = stats[i]
+                if area < 20:
+                    continue
+                
+                cx, cy = int(centroids[i][0]), int(centroids[i][1])
+                iris_r = max(3, min(ew, eh) // 3)
+                
+                yy, xx = np.mgrid[0:h, 0:w]
+                dist = np.sqrt((xx - cx)**2 + (yy - cy)**2)
+                circle = (dist <= iris_r).astype(np.uint8)
+                
+                iris = circle & eye_np
+                iris_mask = iris_mask | torch.from_numpy(iris)
+        
+        return iris_mask
+
+
+class FaceParsingFaceIsolate:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "result": ("FACE_PARSING_RESULT", {}),
+                "include_glasses": ("BOOLEAN", {"default": True}),
+                "include_neck": ("BOOLEAN", {"default": False}),
+            }
+        }
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "main"
+    CATEGORY = "face_parsing"
+
+    def main(self, result, include_glasses, include_neck):
+        face_labels = [1, 2, 4, 5, 6, 7, 10, 11, 12]
+        
+        masks = []
+        for item in result:
+            mask = torch.zeros(item.shape, dtype=torch.uint8)
+            for label in face_labels:
+                mask = mask | (item == label).byte()
+            
+            if include_glasses:
+                mask = mask | (item == 3).byte()
+            if include_neck:
+                mask = mask | (item == 17).byte()
+            
+            masks.append(mask.float())
+        
+        return (torch.stack(masks, dim=0),)
+
+
+class FaceParsingPhiltrumMask:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "result": ("FACE_PARSING_RESULT", {}),
+            }
+        }
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "main"
+    CATEGORY = "face_parsing"
+
+    def main(self, result):
+        masks = []
+        for item in result:
+            ph_mask = self._compute_philtrum(item)
+            if ph_mask is None:
+                ph_mask = torch.zeros(item.shape, dtype=torch.uint8)
+            masks.append(ph_mask.float())
+        return (torch.stack(masks, dim=0),)
+
+    def _compute_philtrum(self, item):
+        nose_bool = (item == 2)
+        ulip_bool = (item == 11)
+        if not nose_bool.any() or not ulip_bool.any():
+            return None
+        
+        nose_rows, nose_cols_all = torch.where(nose_bool)
+        ulip_rows, ulip_cols_all = torch.where(ulip_bool)
+        nose_bottom = int(nose_rows.max().item())
+        ulip_top = int(ulip_rows.min().item())
+        n_left = int(nose_cols_all.min().item())
+        n_right = int(nose_cols_all.max().item())
+        u_left = int(ulip_cols_all.min().item())
+        u_right = int(ulip_cols_all.max().item())
+        ph_left = max(n_left, u_left)
+        ph_right = min(n_right, u_right)
+        if ph_left >= ph_right:
+            ph_left = (n_left + u_left) // 2
+            ph_right = (n_right + u_right) // 2
+        row_start = min(nose_bottom, ulip_top) - 1
+        row_end = max(nose_bottom, ulip_top) + 2
+        ph_left = max(0, ph_left - 2)
+        ph_right = min(w - 1, ph_right + 2)
+        ph_mask = torch.zeros(item.shape, dtype=torch.uint8)
+        ph_mask[row_start:row_end, ph_left:ph_right + 1] = 1
+        ph_mask = ph_mask & (~nose_bool).byte() & (~ulip_bool).byte()
+        return ph_mask
+
+
+class MaskInclude:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask_a": ("MASK", {}),
+                "mask_b": ("MASK", {}),
+            }
+        }
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "main"
+    CATEGORY = "face_parsing"
+
+    def main(self, mask_a, mask_b):
+        return (mask_a * mask_b,)
+
+
+class MaskExclude:
+    def __init__(self):
+        pass
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "base_mask": ("MASK", {}),
+                "mask_to_remove": ("MASK", {}),
+            }
+        }
+
+    RETURN_TYPES = ("MASK",)
+    FUNCTION = "main"
+    CATEGORY = "face_parsing"
+
+    def main(self, base_mask, mask_to_remove):
+        return (torch.clamp(base_mask - mask_to_remove, min=0),)
+
+
 NODE_CLASS_MAPPINGS = {
     'BBoxDetectorLoader(FaceParsing)': BBoxDetectorLoader,
     'BBoxDetect(FaceParsing)': BBoxDetect,
@@ -1493,6 +1854,11 @@ NODE_CLASS_MAPPINGS = {
     'FaceParsingModelLoader(FaceParsing)': FaceParsingModelLoader,
     'FaceParse(FaceParsing)': FaceParse,
     'FaceParsingResultsParser(FaceParsing)': FaceParsingResultsParser,
+    'FaceParsingMaskBuilder(FaceParsing)': FaceParsingMaskBuilder,
+    'FaceParsingFaceIsolate(FaceParsing)': FaceParsingFaceIsolate,
+    'FaceParsingPhiltrumMask(FaceParsing)': FaceParsingPhiltrumMask,
+    'MaskInclude(FaceParsing)': MaskInclude,
+    'MaskExclude(FaceParsing)': MaskExclude,
 
     # 'SkinDetectTraditional(FaceParsing)':SkinDetectTraditional,
     
